@@ -1,11 +1,13 @@
 # =============================================================
 #  ROS Noetic + Husky + Gazebo + Navigation + SLAM + Frontier
+#  Option B (clean): code-only bind mount; build artifacts in volumes
 #  Ubuntu 20.04 | GUI (X11) compatible
 # =============================================================
 FROM ubuntu:20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
+
 RUN apt-get update && apt-get install -y \
     locales lsb-release gnupg2 curl wget git sudo \
     build-essential vim nano apt-utils tzdata \
@@ -23,12 +25,13 @@ RUN sh -c 'echo "deb http://packages.ros.org/ros/ubuntu $(lsb_release -sc) main"
 RUN echo "source /opt/ros/noetic/setup.bash" >> /root/.bashrc
 
 # ----------------------------
-# Dev tools + rosdep
+# Dev tools + rosdep + catkin_tools
 # ----------------------------
 RUN apt-get update && apt-get install -y \
     python3-rosdep python3-rosinstall python3-wstool \
-    python3-catkin-tools python3-rosinstall-generator
-RUN rosdep init && rosdep update
+    python3-catkin-tools python3-rosinstall-generator \
+ && rosdep init \
+ && rosdep update
 
 # ----------------------------
 # Core runtime pkgs (APT binaries)
@@ -48,14 +51,13 @@ RUN apt-get install -y \
     ros-noetic-amcl \
     ros-noetic-move-base
 
-# SLAM choices (pick at runtime)
+# SLAM options
 RUN apt-get install -y \
     ros-noetic-slam-gmapping \
     ros-noetic-rtabmap-ros
 
 # Exploration packages
 RUN apt-get install -y \
-    ros-noetic-frontier-exploration \
     ros-noetic-explore-lite
 
 # depthimage_to_laserscan (apt is simpler than source)
@@ -65,25 +67,9 @@ RUN apt-get install -y ros-noetic-depthimage-to-laserscan
 RUN apt-get install -y \
     ros-noetic-tf2-tools ros-noetic-rqt ros-noetic-rqt-common-plugins
 
-# ----------------------------
-# Python deps for your frontier_ranker
-# ----------------------------
+# Python deps for frontier ranking
 RUN apt-get update && apt-get install -y \
     python3-pip python3-numpy python3-opencv
-
-# ----------------------------
-# Catkin workspace for your custom packages (visited layer, ranker)
-# ----------------------------
-RUN mkdir -p /root/catkin_ws/src
-WORKDIR /root/catkin_ws/src
-
-# (Optional) drop your packages here later with docker build --add or COPY:
-# COPY visited_layer_ros /root/catkin_ws/src/visited_layer_ros
-# COPY frontier_ranker_ros /root/catkin_ws/src/frontier_ranker_ros
-
-WORKDIR /root/catkin_ws
-RUN /bin/bash -c "source /opt/ros/noetic/setup.bash && catkin_make"
-RUN echo "source /root/catkin_ws/devel/setup.bash" >> /root/.bashrc
 
 # ----------------------------
 # GUI / X11
@@ -92,7 +78,13 @@ RUN apt-get update && apt-get install -y \
     mesa-utils x11-apps x11-xserver-utils \
     libgl1-mesa-glx libxext6 libxrender1 libglu1-mesa-dev
 ENV QT_X11_NO_MITSHM=1
-ENV DISPLAY=:0
 
-WORKDIR /root
+# ----------------------------
+# Workspace entrypoint
+# ----------------------------
+WORKDIR /ws
+COPY entrypoint.sh /ws/entrypoint.sh
+RUN chmod +x /ws/entrypoint.sh
+
 CMD ["/bin/bash"]
+

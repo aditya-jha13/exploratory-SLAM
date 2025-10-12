@@ -1,36 +1,10 @@
-🧠 How to Build and Run
-1️⃣ Build the image
-docker build -t husky_noetic:latest .
-
-2️⃣ Run the container
-docker run -it --name husky_dev husky_noetic:latest
-
-3️⃣ Inside container
-source /opt/ros/noetic/setup.bash
-source /root/catkin_ws/devel/setup.bash
-roslaunch husky_gazebo husky_playpen.launch
-
-You can optionally mount your local workspace:
-
-docker run -it -v ~/catkin_ws:/root/catkin_ws husky_noetic:latest
-
-1️⃣ Allow Docker to access your display:
-xhost +local:docker
-
-2️⃣ Run the container:
-docker run -it \
-    --env="DISPLAY=$DISPLAY" \
-    --env="QT_X11_NO_MITSHM=1" \
-    --volume="/tmp/.X11-unix:/tmp/.X11-unix:rw" \
-    --name husky_gui \
-    husky_noetic:latest
+export HUSKY_UST10_ENABLED=1; export HUSKY_UST10_TOPIC=front/scan
+roslaunch frontier_ranker_ros sim_boxes.launch
 
 
-✅ You can now launch GUI apps like RViz or Gazebo directly from inside the container.
+roslaunch husky_navigation gmapping_demo.launch
 
-3️⃣ Inside container:
-source /opt/ros/noetic/setup.bash
-source /root/catkin_ws/devel/setup.bash
-roslaunch husky_gazebo husky_playpen.launch
-# or
-rosrun rviz rviz
+
+roslaunch husky_viz view_robot.launch
+
+roslaunch frontier_ranker_ros exploration_ranker.launch

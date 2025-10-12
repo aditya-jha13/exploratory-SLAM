@@ -1,0 +1,45 @@
+services:
+  husky:
+    build: .
+    image: husky_noetic:latest
+    container_name: husky_gui
+    network_mode: host
+    ipc: host
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: ${DISPLAY}
+      QT_X11_NO_MITSHM: "1"
+      # Prefer hardware OpenGL when available
+      LIBGL_ALWAYS_SOFTWARE: "0"
+      # NVIDIA PRIME render offload (hybrid iGPU + dGPU)
+      __NV_PRIME_RENDER_OFFLOAD: "1"
+      __GLX_VENDOR_LIBRARY_NAME: "nvidia"
+      __VK_LAYER_NV_optimus: "NVIDIA_only"
+      # NVIDIA runtime variables (requires nvidia-container-toolkit on host)
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "graphics,utility,compute"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ../src:/ws/src:ro
+      - ./entrypoint.sh:/ws/entrypoint.sh:ro
+      - catkin_build:/ws/build
+      - catkin_devel:/ws/devel
+      - catkin_install:/ws/install
+    working_dir: /ws
+    # Intel/AMD GPU passthrough (DRI) — optional with NVIDIA
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    # If you have NVIDIA + nvidia-container-toolkit installed, uncomment:
+    gpus: all
+    # environment:
+    #   NVIDIA_VISIBLE_DEVICES: "all"
+    #   NVIDIA_DRIVER_CAPABILITIES: "graphics,utility,compute"
+    # Keep container alive even if entrypoint exits early
+    command: ["/bin/bash", "-lc", "/ws/entrypoint.sh; exec sleep infinity"]
+volumes:
+  catkin_build:
+  catkin_devel:
+  catkin_install:

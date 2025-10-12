@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>frontier_ranker_ros</name>
+  <version>0.1.0</version>
+  <description>Frontier clustering and prioritized selection for exploration.</description>
+  <maintainer email="maintainer@example.com">Maintainer</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>roscpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>costmap_2d</depend>
+
+  <export/>
+</package>
+

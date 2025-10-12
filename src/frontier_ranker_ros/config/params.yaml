@@ -1,0 +1,25 @@
+alpha: 1.0
+beta: 1.0
+gamma: 2.0
+min_cluster_size: 10
+frontier_connectivity: 4
+plan_tolerance: 0.5
+path_sample_step: 0.1
+update_rate: 0.3
+make_plan_service: /move_base/make_plan
+
+robot_radius: 0.3
+publish_rate: 1.0
+visit_value: 100
+
+
+# Debug/instrumentation
+debug_per_cluster: true
+max_debug_clusters: 5
+max_plans_per_cycle: 30
+warn_if_over_s: 0.5
+
+# ROI + CV-based frontier detection
+search_radius_m: 25.0
+dilate_kernel: 3
+
