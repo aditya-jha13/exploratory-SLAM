@@ -1,7 +1,7 @@
-alpha: 1.0
-beta: 1.0
-gamma: 2.0
-min_cluster_size: 10
+alpha: 0.8
+beta: 0.4
+gamma: 2.5
+min_cluster_size: 5
 frontier_connectivity: 4
 plan_tolerance: 0.5
 path_sample_step: 0.1
@@ -20,6 +20,28 @@ max_plans_per_cycle: 30
 warn_if_over_s: 0.5
 
 # ROI + CV-based frontier detection
-search_radius_m: 25.0
-dilate_kernel: 3
+search_radius_m: 50.00
+dilate_kernel: 5
 
+goal_offset_m: 0.8
+fallback_ring_radius_m: 3.0
+fallback_ring_samples: 16
+stuck_timeout: 1.5
+stuck_min_progress: 0.3
+wander_distance: 6.0
+wander_angle_step_deg: 30
+goal_reached_radius: 5.0
+goal_reached_cooldown_s: 0.5
+goal_clearance_m: 5.0
+clearance_window_m: 0.8
+unknown_is_obstacle_for_goal: false
+visited_threshold: 50
+dt_mask_size: 3
+
+# Goal management (hysteresis + tabu + completion)
+retarget_hold_time_s: 6.0
+retarget_min_score_gain: 100.0
+goal_tabu_radius_m: 2.0
+goal_tabu_duration_s: 30.0
+done_unknown_ratio: 0.01
+done_hold_s: 10.0
