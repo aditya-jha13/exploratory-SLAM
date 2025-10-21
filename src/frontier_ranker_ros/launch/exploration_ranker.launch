@@ -2,7 +2,7 @@
   <arg name="global_frame" default="map"/>
   <arg name="robot_base_frame" default="base_link"/>
 
-  <rosparam file="$(find frontier_ranker_ros)/config/params.yaml" command="load"/>
+  <!-- Load params into the frontier_ranker node's private namespace -->
 
   <node pkg="frontier_ranker_ros" type="visited_grid_node.py" name="visited_grid" output="screen">
     <param name="global_frame" value="$(arg global_frame)"/>
@@ -12,6 +12,6 @@
   <node pkg="frontier_ranker_ros" type="frontier_ranker_node.py" name="frontier_ranker" output="screen">
     <param name="global_frame" value="$(arg global_frame)"/>
     <param name="robot_base_frame" value="$(arg robot_base_frame)"/>
+    <rosparam file="$(find frontier_ranker_ros)/config/params.yaml" command="load"/>
   </node>
 </launch>
-

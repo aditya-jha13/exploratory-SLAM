@@ -1,12 +1,13 @@
 alpha: 0.8
-beta: 0.4
-gamma: 2.5
+beta: 0.7
+gamma: 3.0
 min_cluster_size: 5
 frontier_connectivity: 4
 plan_tolerance: 0.5
 path_sample_step: 0.1
-update_rate: 0.3
+update_rate: 2.0
 make_plan_service: /move_base/make_plan
+use_make_plan: true
 
 robot_radius: 0.3
 publish_rate: 1.0
@@ -18,6 +19,8 @@ debug_per_cluster: true
 max_debug_clusters: 5
 max_plans_per_cycle: 30
 warn_if_over_s: 0.5
+max_think_time_s: 5.0
+allow_heuristic_fallback: true
 
 # ROI + CV-based frontier detection
 search_radius_m: 50.00
@@ -30,13 +33,16 @@ stuck_timeout: 1.5
 stuck_min_progress: 0.3
 wander_distance: 6.0
 wander_angle_step_deg: 30
-goal_reached_radius: 5.0
-goal_reached_cooldown_s: 0.5
-goal_clearance_m: 5.0
+goal_reached_radius: 1.5
+goal_reached_cooldown_s: 1.0
+goal_clearance_m: 2.0
 clearance_window_m: 0.8
 unknown_is_obstacle_for_goal: false
 visited_threshold: 50
 dt_mask_size: 3
+goal_revisit_penalty: 150.0
+goal_revisit_radius_m: 8.0
+goal_revisit_area_weight: 50.0
 
 # Goal management (hysteresis + tabu + completion)
 retarget_hold_time_s: 6.0

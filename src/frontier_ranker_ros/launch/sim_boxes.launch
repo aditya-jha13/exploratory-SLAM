@@ -3,7 +3,7 @@
   <env name="HUSKY_UST10_ENABLED" value="1"/>
   <env name="HUSKY_UST10_TOPIC" value="front/scan"/>
   <include file="$(find gazebo_ros)/launch/empty_world.launch">
-    <arg name="world_name" value="$(find frontier_ranker_ros)/worlds/simple_boxes.world"/>
+    <arg name="world_name" value="$(find frontier_ranker_ros)/worlds/exploratory.world"/>
     <arg name="use_sim_time" value="true"/>
     <arg name="gui" value="true"/>
     <arg name="headless" value="false"/>

@@ -12,6 +12,7 @@ from nav_msgs.srv import GetPlan, GetPlanRequest
 import tf2_ros
 import cv2
 from visualization_msgs.msg import Marker
+from std_msgs.msg import Bool
 
 
 class FrontierRankerNode:
@@ -35,12 +36,29 @@ class FrontierRankerNode:
         self.unknown_is_obstacle_for_goal = bool(rospy.get_param("~unknown_is_obstacle_for_goal", True))
         self.dt_mask_size = int(rospy.get_param("~dt_mask_size", 3))
         self.visited_threshold = int(rospy.get_param("~visited_threshold", 50))
+        # Extra penalty if the goal point is already marked visited
+        self.goal_revisit_penalty = float(rospy.get_param("~goal_revisit_penalty", 0.0))
+        self.goal_revisit_radius_m = float(rospy.get_param("~goal_revisit_radius_m", 0.0))
+        self.goal_revisit_area_weight = float(rospy.get_param("~goal_revisit_area_weight", 0.0))
         self.make_plan_service = rospy.get_param("~make_plan_service", "/move_base/make_plan")
         # Debug/Perf params
         self.debug_per_cluster = bool(rospy.get_param("~debug_per_cluster", False))
         self.max_debug_clusters = int(rospy.get_param("~max_debug_clusters", 5))
         self.max_plans_per_cycle = int(rospy.get_param("~max_plans_per_cycle", 50))
         self.warn_if_over_s = float(rospy.get_param("~warn_if_over_s", 0.5))
+        self.use_make_plan = bool(rospy.get_param("~use_make_plan", True))
+        # Hard time budget for candidate evaluation
+        self.max_think_time_s = float(rospy.get_param("~max_think_time_s", 5.0))
+        # Only publish a goal without a verified plan if allowed
+        self.allow_heuristic_fallback = bool(rospy.get_param("~allow_heuristic_fallback", False))
+        # Retargeting and tabu defaults
+        self.retarget_hold_time_s = float(rospy.get_param("~retarget_hold_time_s", 2.0))
+        self.retarget_min_score_gain = float(rospy.get_param("~retarget_min_score_gain", 0.5))
+        self.goal_tabu_duration_s = float(rospy.get_param("~goal_tabu_duration_s", 30.0))
+        # Stuck retarget behavior (immediate override)
+        self.stuck_retarget_after_s = float(rospy.get_param("~stuck_retarget_after_s", 3.0))
+        self.stuck_no_move_dist_m = float(rospy.get_param("~stuck_no_move_dist_m", 0.05))
+        self.config_pose_tolerance_m = float(rospy.get_param("~config_pose_tolerance_m", 0.10))
         # Stuck/wander fallback
         self.stuck_timeout = float(rospy.get_param("~stuck_timeout", 12.0))
         self.stuck_min_progress = float(rospy.get_param("~stuck_min_progress", 0.3))
@@ -88,6 +106,16 @@ class FrontierRankerNode:
 
         # Timer
         self._last_goal = None
+        self._last_goal_score = None
+        self._last_goal_publish_time = rospy.Time(0)
+        self._publish_pose_at_goal = None  # (x, y) at publish time
+        # Candidates considered for the configuration when last goal was published
+        self._last_config_candidates = None  # list of (score, x, y) sorted desc
+        self._last_config_pose = None        # (x, y) robot pose used to compute candidates
+        self._last_config_map_stamp = None   # map header stamp at that time
+        self._config_published_indices = set()
+        # Backoff for make_plan service failures to reduce log spam
+        self._make_plan_backoff_until = rospy.Time(0)
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.update_rate, 1e-3)), self._on_timer)
 
         # Progress tracking
@@ -99,6 +127,8 @@ class FrontierRankerNode:
 
         # Waypoint history
         self._waypoint_history = []  # list of (x, y)
+        # Short-term goal tabu history (timestamp, x, y)
+        self._goal_history = []
         self._no_candidate_count = 0
 
         # Visualization publishers
@@ -142,6 +172,31 @@ class FrontierRankerNode:
             return grid[my, mx] == 0
         return False
 
+    def _is_clear_world(self, x: float, y: float, grid: np.ndarray, info, clear_m: float) -> bool:
+        """Returns True if the disc of radius `clear_m` around (x,y) is free.
+        Treats unknown as obstacle if `unknown_is_obstacle_for_goal` is True."""
+        if clear_m <= 1e-6:
+            return self._is_free_world(x, y, grid, info)
+        res = max(getattr(info, 'resolution', 0.0), 1e-6)
+        r_cells = max(1, int(clear_m / res))
+        mx_c, my_c = self._world_to_map(x, y, info)
+        r2 = r_cells * r_cells
+        for dy in range(-r_cells, r_cells + 1):
+            for dx in range(-r_cells, r_cells + 1):
+                if dx*dx + dy*dy > r2:
+                    continue
+                mx = mx_c + dx
+                my = my_c + dy
+                if not (0 <= mx < info.width and 0 <= my < info.height):
+                    # Outside map treated as obstacle
+                    return False
+                v = int(grid[my, mx])
+                if v > 0:
+                    return False
+                if v < 0 and self.unknown_is_obstacle_for_goal:
+                    return False
+        return True
+
     def _map_to_world(self, mx: int, my: int) -> Tuple[float, float]:
         info = self.map_info.info
         x = info.origin.position.x + (mx + 0.5) * info.resolution
@@ -151,6 +206,8 @@ class FrontierRankerNode:
         # Old grid-scan frontier helpers removed (replaced by OpenCV pipeline)
 
     def _plan(self, start: Pose, goal_xy: Tuple[float, float]) -> Optional[Path]:
+        if not self.use_make_plan:
+            return None
         req = GetPlanRequest()
         req.start = PoseStamped()
         req.start.header.stamp = rospy.Time.now()
@@ -164,12 +221,18 @@ class FrontierRankerNode:
         req.goal.pose.orientation.w = 1.0
         req.tolerance = self.plan_tolerance
         try:
+            if rospy.Time.now() < self._make_plan_backoff_until:
+                return None
             resp = self.make_plan(req)
             if resp.plan and len(resp.plan.poses) > 0:
                 return resp.plan
+            # Empty plan response; short backoff
+            self._make_plan_backoff_until = rospy.Time.now() + rospy.Duration(1.0)
             return None
         except rospy.ServiceException as ex:
             rospy.logwarn_throttle(2.0, f"[frontier_ranker] GetPlan failed: {ex}")
+            # Back off further to avoid hammering move_base when it's active
+            self._make_plan_backoff_until = rospy.Time.now() + rospy.Duration(2.0)
             return None
 
 
@@ -276,6 +339,40 @@ class FrontierRankerNode:
                 samples += 1
         return penalty, samples
 
+    def _visited_fraction_around(self, x: float, y: float) -> float:
+        """Return fraction of cells marked visited within a radius around (x,y)."""
+        if self.visited_grid is None or self.visited_info is None:
+            return 0.0
+        if self.goal_revisit_radius_m <= 1e-6:
+            return 0.0
+        info = self.visited_info.info
+        res = max(info.resolution, 1e-6)
+        r_cells = max(1, int(self.goal_revisit_radius_m / res))
+        mx_center = int((x - info.origin.position.x) / res)
+        my_center = int((y - info.origin.position.y) / res)
+        total = 0
+        visited = 0
+        r2 = r_cells * r_cells
+        for dy in range(-r_cells, r_cells + 1):
+            for dx in range(-r_cells, r_cells + 1):
+                if dx*dx + dy*dy > r2:
+                    continue
+                mx = mx_center + dx
+                my = my_center + dy
+                if 0 <= mx < info.width and 0 <= my < info.height:
+                    total += 1
+                    if int(self.visited_grid[my, mx]) >= self.visited_threshold:
+                        visited += 1
+        if total == 0:
+            return 0.0
+        return float(visited) / float(total)
+
+    def _fallback_farthest_goal(self, grid: np.ndarray, info_meta, pose: Pose):
+        """Placeholder fallback: no-op. Returns None to skip fallback behavior.
+        Implement selection of a farthest feasible goal if desired.
+        """
+        return None
+
     def _on_timer(self, _evt):
         t0 = time.time()
         with self.map_lock:
@@ -295,6 +392,78 @@ class FrontierRankerNode:
             dgrx = self._last_goal[0] - pose.position.x
             dgry = self._last_goal[1] - pose.position.y
             if math.hypot(dgrx, dgry) > self.goal_reached_radius:
+                # If we've not moved since last publish for a while, retarget using
+                # the candidate list computed for that configuration.
+                now_rt = rospy.Time.now()
+                try_retarget = False
+                if self._last_goal_publish_time and self._last_goal_publish_time != rospy.Time(0):
+                    elapsed = (now_rt - self._last_goal_publish_time).to_sec()
+                    if elapsed >= self.stuck_retarget_after_s and self._publish_pose_at_goal is not None:
+                        moved = math.hypot(pose.position.x - self._publish_pose_at_goal[0],
+                                           pose.position.y - self._publish_pose_at_goal[1])
+                        if moved <= self.stuck_no_move_dist_m:
+                            try_retarget = True
+                if try_retarget:
+                    # Check same configuration (map stamp and pose closeness)
+                    same_map = False
+                    try:
+                        same_map = (self._last_config_map_stamp == info.header.stamp)
+                    except Exception:
+                        same_map = False
+                    same_pose = (self._last_config_pose is not None and
+                                 math.hypot(pose.position.x - self._last_config_pose[0],
+                                            pose.position.y - self._last_config_pose[1]) <= self.config_pose_tolerance_m)
+                    if same_map and same_pose and self._last_config_candidates:
+                        # Pick next unused candidate by score
+                        for i, (s, gx, gy) in enumerate(self._last_config_candidates):
+                            if i in self._config_published_indices:
+                                continue
+                            if self._last_goal and abs(gx - self._last_goal[0]) <= 1e-6 and abs(gy - self._last_goal[1]) <= 1e-6:
+                                continue
+                            # Publish alternative goal from same configuration
+                            msg = PoseStamped()
+                            msg.header.stamp = now_rt
+                            msg.header.frame_id = self.global_frame
+                            msg.pose.position.x = gx
+                            msg.pose.position.y = gy
+                            msg.pose.orientation.w = 1.0
+                            self.goal_pub.publish(msg)
+                            self._last_goal = (gx, gy)
+                            self._last_goal_publish_time = now_rt
+                            self._last_goal_score = s
+                            self._publish_pose_at_goal = (pose.position.x, pose.position.y)
+                            # History + marker
+                            self._goal_history.append((now_rt, gx, gy))
+                            cutoff = now_rt - rospy.Duration(self.goal_tabu_duration_s)
+                            self._goal_history = [(t, x, y) for (t, x, y) in self._goal_history if t >= cutoff]
+                            pt = PointStamped()
+                            pt.header.stamp = now_rt
+                            pt.header.frame_id = self.global_frame
+                            pt.point.x, pt.point.y, pt.point.z = gx, gy, 0.0
+                            self.goal_point_pub.publish(pt)
+                            mk = Marker()
+                            mk.header = pt.header
+                            mk.ns = "frontier_ranker"
+                            mk.id = 2
+                            mk.type = Marker.SPHERE
+                            mk.action = Marker.ADD
+                            mk.pose.position.x = gx
+                            mk.pose.position.y = gy
+                            mk.pose.position.z = 0.05
+                            mk.pose.orientation.w = 1.0
+                            mk.scale.x = 0.2
+                            mk.scale.y = 0.2
+                            mk.scale.z = 0.2
+                            mk.color.r = 0.2
+                            mk.color.g = 0.6
+                            mk.color.b = 1.0
+                            mk.color.a = 0.9
+                            mk.lifetime = rospy.Duration(2.0)
+                            self.goal_marker_pub.publish(mk)
+                            self._config_published_indices.add(i)
+                            rospy.logwarn("[frontier_ranker] Retargeted due to no movement for %.1fs to alternative goal (%.2f, %.2f)",
+                                          elapsed, gx, gy)
+                            return
                 return
             else:
                 rospy.loginfo("[frontier_ranker] Goal reached within %.2fm", self.goal_reached_radius)
@@ -392,12 +561,23 @@ class FrontierRankerNode:
                                        self.waypoint_exclusion_radius_m)
                 return
 
+        ranked = []       # (score, x, y) for candidates with valid path
+        ranked_any = []   # (approx_score, x, y, size) for all candidates (pre-plan)
+        t_eval_start = time.time()
         for idx, cand in enumerate(clusters):
             if plans_attempted >= max(1, getattr(self, "max_plans_per_cycle", 50)):
                 break
             cx, cy, csize = cand
+            # Approx score (no path): favor large frontier and proximity
+            approx_L = math.hypot(cx - pose.position.x, cy - pose.position.y)
+            approx_score = self.alpha * float(csize) - self.beta * approx_L
+            ranked_any.append((approx_score, cx, cy, csize))
 
-            # Nudge goal towards robot to land in free space
+            # Stop early if we have exceeded think budget and already have a best path
+            if (time.time() - t_eval_start) >= self.max_think_time_s and best_goal is not None:
+                break
+
+            # Nudge goal towards robot to land in free and clear space
             if getattr(self, "goal_offset_m", 0.0) > 1e-6:
                 dx = pose.position.x - cx
                 dy = pose.position.y - cy
@@ -405,10 +585,10 @@ class FrontierRankerNode:
                 if n > 1e-6:
                     nx = cx + (dx / n) * self.goal_offset_m
                     ny = cy + (dy / n) * self.goal_offset_m
-                    if self._is_free_world(nx, ny, grid, info.info):
+                    if self._is_clear_world(nx, ny, grid, info.info, self.goal_clearance_m):
                         cx, cy = nx, ny
-            # Fallback ring sampling if still not free
-            if not self._is_free_world(cx, cy, grid, info.info):
+            # Ensure goal has required clearance; try ring sampling if not
+            if not self._is_clear_world(cx, cy, grid, info.info, self.goal_clearance_m):
                 import math as _m
                 samples = max(4, getattr(self, "fallback_ring_samples", 16))
                 r = max(0.1, getattr(self, "fallback_ring_radius_m", 0.5))
@@ -416,9 +596,15 @@ class FrontierRankerNode:
                     ang = 2.0 * _m.pi * float(k) / float(samples)
                     tx = cx + r * _m.cos(ang)
                     ty = cy + r * _m.sin(ang)
-                    if self._is_free_world(tx, ty, grid, info.info):
+                    if self._is_clear_world(tx, ty, grid, info.info, self.goal_clearance_m):
                         cx, cy = tx, ty
                         break
+            # If still not clear enough, skip this candidate
+            if not self._is_clear_world(cx, cy, grid, info.info, self.goal_clearance_m):
+                if getattr(self, "debug_per_cluster", False) and idx < getattr(self, "max_debug_clusters", 5):
+                    rospy.loginfo("[frontier_ranker] cand#%d rejected: insufficient clearance (>=%.2fm)",
+                                  idx, getattr(self, "goal_clearance_m", 0.0))
+                continue
 
             t_before_plan = time.time()
             path = self._plan(pose, (cx, cy))
@@ -437,30 +623,84 @@ class FrontierRankerNode:
             visited_pen, samples = self._visited_penalty_along(path)
             dt_pen = time.time() - t_before_pen
             t_pen_total += dt_pen
-            score = self.alpha * float(csize) - self.beta * L - self.gamma * visited_pen
+            # Extra penalty if the goal cell or its surrounding area is already visited
+            extra_goal_pen = 0.0
+            if self.visited_grid is not None and self.visited_info is not None:
+                vinfo = self.visited_info.info
+                mxg = int((cx - vinfo.origin.position.x) / max(vinfo.resolution, 1e-6))
+                myg = int((cy - vinfo.origin.position.y) / max(vinfo.resolution, 1e-6))
+                if 0 <= mxg < vinfo.width and 0 <= myg < vinfo.height:
+                    vcell = int(self.visited_grid[myg, mxg])
+                    if vcell >= self.visited_threshold:
+                        extra_goal_pen = self.goal_revisit_penalty
+                # Area fraction penalty
+                area_frac = self._visited_fraction_around(cx, cy)
+                if area_frac > 0.0 and self.goal_revisit_area_weight > 0.0:
+                    extra_goal_pen += (self.goal_revisit_area_weight * area_frac)
+            score = self.alpha * float(csize) - self.beta * L - self.gamma * visited_pen - extra_goal_pen
 
             if getattr(self, "debug_per_cluster", False) and idx < getattr(self, "max_debug_clusters", 5):
                 rospy.loginfo("[frontier_ranker] cand#%d size=%d centroid=(%.2f,%.2f) plan: OK len=%.2f pen=%.1f(samples=%d) score=%.2f times: plan=%.3f pen=%.3f",
                               idx, csize, cx, cy, L, visited_pen, samples, score, dt_plan, dt_pen)
 
+            ranked.append((score, cx, cy))
             if score > best_score:
                 best_score = score
                 best_goal = (cx, cy)
                 best_len = L
                 best_pen = visited_pen
 
+            # Enforce time budget after evaluating this candidate
+            if (time.time() - t_eval_start) >= self.max_think_time_s:
+                break
 
-        # If no candidate yielded a valid plan, skip publishing this cycle
+
+        # If no path found within time budget, optionally fall back to best frontier by heuristic
         if best_goal is None:
-            rospy.loginfo_throttle(2.0, "[frontier_ranker] No reachable candidates after planning (attempted=%d)", plans_attempted)
-            return
+            if self.allow_heuristic_fallback and ranked_any:
+                ranked_any.sort(key=lambda t: t[0], reverse=True)
+                approx_score, ax, ay, asz = ranked_any[0]
+                best_goal = (ax, ay)
+                best_score = approx_score
+                best_len = math.hypot(ax - pose.position.x, ay - pose.position.y)
+                best_pen = float('nan')
+                rospy.logwarn_throttle(2.0, "[frontier_ranker] Publishing heuristic best (no plan in %.1fs)",
+                                       max(0.0, time.time() - t_eval_start))
+            else:
+                rospy.loginfo_throttle(2.0, "[frontier_ranker] No candidates available to publish")
+                return
 
         # Retarget hysteresis: hold current goal unless better enough and hold time passed
+        now = rospy.Time.now()
         if self._last_goal is not None and self._last_goal_score is not None:
             if (now - self._last_goal_publish_time).to_sec() < self.retarget_hold_time_s:
                 return
             if (best_score - self._last_goal_score) < self.retarget_min_score_gain:
                 return
+
+        # Store configuration candidates ranked by score (desc) for potential stuck retargeting
+        ranked.sort(key=lambda t: t[0], reverse=True)
+        if ranked:
+            self._last_config_candidates = ranked
+        else:
+            # If no valid paths yet, optionally fall back to heuristic-ranked candidates
+            if self.allow_heuristic_fallback and ranked_any:
+                ranked_any.sort(key=lambda t: t[0], reverse=True)
+                self._last_config_candidates = [(s, x, y) for (s, x, y, _sz) in ranked_any]
+            else:
+                self._last_config_candidates = []
+        self._last_config_pose = (pose.position.x, pose.position.y)
+        try:
+            self._last_config_map_stamp = info.header.stamp
+        except Exception:
+            self._last_config_map_stamp = None
+        self._config_published_indices = set()
+        # Determine index of best in ranked list
+        best_idx = None
+        for i, (s, gx, gy) in enumerate(ranked):
+            if abs(gx - best_goal[0]) <= 1e-6 and abs(gy - best_goal[1]) <= 1e-6:
+                best_idx = i
+                break
 
         msg = PoseStamped()
         msg.header.stamp = rospy.Time.now()
@@ -472,6 +712,9 @@ class FrontierRankerNode:
         self._last_goal = best_goal
         self._last_goal_publish_time = now
         self._last_goal_score = best_score
+        self._publish_pose_at_goal = (pose.position.x, pose.position.y)
+        if best_idx is not None:
+            self._config_published_indices.add(best_idx)
         # Update tabu history (prune old)
         self._goal_history.append((now, best_goal[0], best_goal[1]))
         cutoff = now - rospy.Duration(self.goal_tabu_duration_s)
@@ -541,14 +784,6 @@ class FrontierRankerNode:
                 self.done_pub.publish(Bool(data=True))
         else:
             self._done_since = None
-
-    
-
-
-
-
-    
-
 
 def main():
     rospy.init_node("frontier_ranker_node")
