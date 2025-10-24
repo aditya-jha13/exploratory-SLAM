@@ -9,6 +9,10 @@ update_rate: 2.0
 make_plan_service: /move_base/make_plan
 use_make_plan: true
 
+# Stuck retargeting (no motion -> pick a different frontier)
+stuck_retarget_after_s: 3.0
+stuck_no_move_dist_m: 1.00
+
 robot_radius: 0.3
 publish_rate: 1.0
 visit_value: 100

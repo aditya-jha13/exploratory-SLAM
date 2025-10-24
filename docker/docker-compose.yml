@@ -33,7 +33,7 @@ services:
     group_add:
       - video
     # If you have NVIDIA + nvidia-container-toolkit installed, uncomment:
-    gpus: all
+    # gpus: all
     # environment:
     #   NVIDIA_VISIBLE_DEVICES: "all"
     #   NVIDIA_DRIVER_CAPABILITIES: "graphics,utility,compute"

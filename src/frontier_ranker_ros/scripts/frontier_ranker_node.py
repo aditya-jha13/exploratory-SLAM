@@ -14,6 +14,85 @@ import cv2
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Bool
 
+# Helper imports (robust against stale installed copies) - was facing this issue (GPT-suggested.)
+fc_find_frontiers = None
+fc_path_length = None
+fc_visited_penalty = None
+fc_visited_fraction = None
+
+try:
+    import frontier_core as _fc
+except Exception:
+    _fc = None
+
+def _load_frontier_core_from_paths():
+    import os, sys
+    # Candidate paths: installed script dir and package scripts dir
+    candidates = []
+    try:
+        import rospkg
+        pkg_path = rospkg.RosPack().get_path('frontier_ranker_ros')
+        scripts_dir = os.path.join(pkg_path, 'scripts')
+        candidates.append(os.path.join(scripts_dir, 'frontier_core.py'))
+    except Exception:
+        pass
+    try:
+        here = os.path.dirname(__file__)
+        candidates.append(os.path.join(here, 'frontier_core.py'))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            if path and os.path.isfile(path):
+                import importlib.util, importlib.machinery
+                mod_name = 'frontier_core_fallback'
+                loader = importlib.machinery.SourceFileLoader(mod_name, path)
+                spec = importlib.util.spec_from_loader(mod_name, loader)
+                module = importlib.util.module_from_spec(spec)
+                loader.exec_module(module)
+                required = [
+                    'find_frontier_candidates_cv',
+                    'path_length',
+                    'visited_penalty_along',
+                    'visited_fraction_around',
+                ]
+                if all(hasattr(module, n) for n in required):
+                    return module
+        except Exception:
+            continue
+    return None
+
+def _bind_fc_aliases(module):
+    global fc_find_frontiers, fc_path_length, fc_visited_penalty, fc_visited_fraction
+    fc_find_frontiers = module.find_frontier_candidates_cv
+    fc_path_length = module.path_length
+    fc_visited_penalty = module.visited_penalty_along
+    fc_visited_fraction = module.visited_fraction_around
+
+_fc_ok = False
+if _fc is not None:
+    try:
+        required = [
+            'find_frontier_candidates_cv',
+            'path_length',
+            'visited_penalty_along',
+            'visited_fraction_around',
+        ]
+        if all(hasattr(_fc, n) for n in required):
+            _bind_fc_aliases(_fc)
+            _fc_ok = True
+    except Exception:
+        _fc_ok = False
+
+if not _fc_ok:
+    _fc2 = _load_frontier_core_from_paths()
+    if _fc2 is not None:
+        _bind_fc_aliases(_fc2)
+        _fc_ok = True
+
+if not _fc_ok:
+    raise ImportError('Unable to import frontier_core with required symbols')
+
 
 class FrontierRankerNode:
     def __init__(self):
@@ -135,6 +214,29 @@ class FrontierRankerNode:
         self.goal_point_pub = rospy.Publisher("~goal_point", PointStamped, queue_size=1, latch=True)
         self.goal_marker_pub = rospy.Publisher("~goal_marker", Marker, queue_size=1, latch=True)
 
+    def _make_marker(self, header, x: float, y: float, *, mid: int = 1,
+                      ns: str = "frontier_ranker", rgb: Tuple[float, float, float] = (1.0, 0.2, 0.2),
+                      alpha: float = 0.9, scale: float = 0.2, z: float = 0.05, lifetime_s: float = 2.0) -> Marker:
+        mk = Marker()
+        mk.header = header
+        mk.ns = ns
+        mk.id = mid
+        mk.type = Marker.SPHERE
+        mk.action = Marker.ADD
+        mk.pose.position.x = x
+        mk.pose.position.y = y
+        mk.pose.position.z = z
+        mk.pose.orientation.w = 1.0
+        mk.scale.x = scale
+        mk.scale.y = scale
+        mk.scale.z = scale
+        mk.color.r = float(rgb[0])
+        mk.color.g = float(rgb[1])
+        mk.color.b = float(rgb[2])
+        mk.color.a = float(alpha)
+        mk.lifetime = rospy.Duration(lifetime_s)
+        return mk
+
     def _on_visited(self, msg: OccupancyGrid):
         grid = np.array(msg.data, dtype=np.int16).reshape((msg.info.height, msg.info.width))
         self.visited_grid = grid
@@ -237,135 +339,42 @@ class FrontierRankerNode:
 
 
     def _find_frontier_candidates_cv(self, grid: np.ndarray, info_msg: OccupancyGrid, pose: Pose):
-        info = info_msg.info
-        res = info.resolution
-        mx = int((pose.position.x - info.origin.position.x) / res)
-        my = int((pose.position.y - info.origin.position.y) / res)
-        rad_cells = max(1, int(self.search_radius_m / max(res, 1e-6)))
-        w, h = info.width, info.height
-        x0 = max(1, mx - rad_cells)
-        y0 = max(1, my - rad_cells)
-        x1 = min(w - 2, mx + rad_cells)
-        y1 = min(h - 2, my + rad_cells)
-        if x1 <= x0 or y1 <= y0:
-            return [], {"roi_w": 0, "roi_h": 0, "frontier_px": 0, "kept": 0}
-        roi = grid[y0:y1+1, x0:x1+1]
-        free = (roi == 0)
-        k = max(1, int(self.dilate_kernel))
-        if k % 2 == 0:
-            k += 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-        unknown = (roi == -1)
-        dil_unknown = cv2.dilate((unknown.astype(np.uint8) * 255), kernel, iterations=1) > 0
-        frontier = np.logical_and(free, dil_unknown).astype(np.uint8)
-        # Distance transform on free mask to favor clear goals
-        free_u8 = (free.astype(np.uint8) * 255)
-        dt = cv2.distanceTransform(free_u8, cv2.DIST_L2, 5 if self.dt_mask_size == 5 else 3)
-        dt_m = dt * res
-        connectivity = 4 if self.frontier_connectivity == 4 else 8
-        num, labels, stats, cents = cv2.connectedComponentsWithStats(frontier, connectivity=connectivity)
-        candidates = []
-        kept = 0
-        for label in range(1, num):
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            if area < self.cluster_min_size:
-                continue
-            mask_label = (labels == label)
-            cx_px, cy_px = cents[label]
-            r_pix = max(1, int(self.clearance_window_m / max(res, 1e-6)))
-            cx_i, cy_i = int(round(cx_px)), int(round(cy_px))
-            xw0 = max(0, cx_i - r_pix)
-            xw1 = min(mask_label.shape[1]-1, cx_i + r_pix)
-            yw0 = max(0, cy_i - r_pix)
-            yw1 = min(mask_label.shape[0]-1, cy_i + r_pix)
-            local_mask = mask_label[yw0:yw1+1, xw0:xw1+1]
-            local_dt = dt_m[yw0:yw1+1, xw0:xw1+1]
-            cand_dt = np.where(local_mask, local_dt, 0.0)
-            iy, ix = np.unravel_index(np.argmax(cand_dt), cand_dt.shape)
-            best_clear = cand_dt[iy, ix]
-            if best_clear <= 0.0:
-                mx_c = int(x0 + cx_px)
-                my_c = int(y0 + cy_px)
-            else:
-                mx_c = x0 + xw0 + ix
-                my_c = y0 + yw0 + iy
-            wx, wy = self._map_to_world(int(mx_c), int(my_c))
-            if best_clear < self.goal_clearance_m:
-                candidates.append((wx, wy, max(1, int(0.5 * area))))
-            else:
-                candidates.append((wx, wy, area))
-            kept += 1
-        return candidates, {"roi_w": (x1 - x0 + 1), "roi_h": (y1 - y0 + 1), "frontier_px": int(frontier.sum()), "kept": kept}
+        return fc_find_frontiers(
+            grid,
+            info_msg,
+            pose,
+            cluster_min_size=self.cluster_min_size,
+            dilate_kernel=self.dilate_kernel,
+            frontier_connectivity=self.frontier_connectivity,
+            clearance_window_m=self.clearance_window_m,
+            dt_mask_size=self.dt_mask_size,
+            goal_clearance_m=self.goal_clearance_m,
+            search_radius_m=self.search_radius_m,
+        )
 
 
     @staticmethod
     def _path_length(path: Path) -> float:
-        pts = path.poses
-        if len(pts) < 2:
-            return 0.0
-        total = 0.0
-        for i in range(1, len(pts)):
-            dx = pts[i].pose.position.x - pts[i - 1].pose.position.x
-            dy = pts[i].pose.position.y - pts[i - 1].pose.position.y
-            total += math.hypot(dx, dy)
-        return total
+        return fc_path_length(path)
 
     def _visited_penalty_along(self, path: Path) -> Tuple[float, int]:
-        if self.visited_grid is None or self.visited_info is None:
-            return 0.0, 0
-        info = self.visited_info.info
-        res = info.resolution
-        penalty = 0.0
-        samples = 0
-        for i in range(1, len(path.poses)):
-            x0 = path.poses[i - 1].pose.position.x
-            y0 = path.poses[i - 1].pose.position.y
-            x1 = path.poses[i].pose.position.x
-            y1 = path.poses[i].pose.position.y
-            seg_len = math.hypot(x1 - x0, y1 - y0)
-            if seg_len < 1e-6:
-                continue
-            steps = max(1, int(seg_len / max(self.path_sample_step, res)))
-            for sidx in range(steps + 1):
-                t = float(sidx) / float(max(steps, 1))
-                xs = x0 + t * (x1 - x0)
-                ys = y0 + t * (y1 - y0)
-                mx = int((xs - info.origin.position.x) / res)
-                my = int((ys - info.origin.position.y) / res)
-                if 0 <= mx < info.width and 0 <= my < info.height:
-                    v = self.visited_grid[my, mx]
-                    if v >= self.visited_threshold:
-                        penalty += 1.0
-                samples += 1
-        return penalty, samples
+        return fc_visited_penalty(
+            path,
+            self.visited_grid,
+            self.visited_info,
+            path_sample_step=self.path_sample_step,
+            visited_threshold=self.visited_threshold,
+        )
 
     def _visited_fraction_around(self, x: float, y: float) -> float:
-        """Return fraction of cells marked visited within a radius around (x,y)."""
-        if self.visited_grid is None or self.visited_info is None:
-            return 0.0
-        if self.goal_revisit_radius_m <= 1e-6:
-            return 0.0
-        info = self.visited_info.info
-        res = max(info.resolution, 1e-6)
-        r_cells = max(1, int(self.goal_revisit_radius_m / res))
-        mx_center = int((x - info.origin.position.x) / res)
-        my_center = int((y - info.origin.position.y) / res)
-        total = 0
-        visited = 0
-        r2 = r_cells * r_cells
-        for dy in range(-r_cells, r_cells + 1):
-            for dx in range(-r_cells, r_cells + 1):
-                if dx*dx + dy*dy > r2:
-                    continue
-                mx = mx_center + dx
-                my = my_center + dy
-                if 0 <= mx < info.width and 0 <= my < info.height:
-                    total += 1
-                    if int(self.visited_grid[my, mx]) >= self.visited_threshold:
-                        visited += 1
-        if total == 0:
-            return 0.0
-        return float(visited) / float(total)
+        return fc_visited_fraction(
+            x,
+            y,
+            self.visited_grid,
+            self.visited_info,
+            goal_revisit_radius_m=self.goal_revisit_radius_m,
+            visited_threshold=self.visited_threshold,
+        )
 
     def _fallback_farthest_goal(self, grid: np.ndarray, info_meta, pose: Pose):
         """Placeholder fallback: no-op. Returns None to skip fallback behavior.
@@ -398,7 +407,7 @@ class FrontierRankerNode:
                 try_retarget = False
                 if self._last_goal_publish_time and self._last_goal_publish_time != rospy.Time(0):
                     elapsed = (now_rt - self._last_goal_publish_time).to_sec()
-                    if elapsed >= self.stuck_retarget_after_s and self._publish_pose_at_goal is not None:
+                    if elapsed >= self.stuck_retarget_after_s:
                         moved = math.hypot(pose.position.x - self._publish_pose_at_goal[0],
                                            pose.position.y - self._publish_pose_at_goal[1])
                         if moved <= self.stuck_no_move_dist_m:
@@ -441,24 +450,7 @@ class FrontierRankerNode:
                             pt.header.frame_id = self.global_frame
                             pt.point.x, pt.point.y, pt.point.z = gx, gy, 0.0
                             self.goal_point_pub.publish(pt)
-                            mk = Marker()
-                            mk.header = pt.header
-                            mk.ns = "frontier_ranker"
-                            mk.id = 2
-                            mk.type = Marker.SPHERE
-                            mk.action = Marker.ADD
-                            mk.pose.position.x = gx
-                            mk.pose.position.y = gy
-                            mk.pose.position.z = 0.05
-                            mk.pose.orientation.w = 1.0
-                            mk.scale.x = 0.2
-                            mk.scale.y = 0.2
-                            mk.scale.z = 0.2
-                            mk.color.r = 0.2
-                            mk.color.g = 0.6
-                            mk.color.b = 1.0
-                            mk.color.a = 0.9
-                            mk.lifetime = rospy.Duration(2.0)
+                            mk = self._make_marker(pt.header, gx, gy, mid=2, rgb=(0.2, 0.6, 1.0))
                             self.goal_marker_pub.publish(mk)
                             self._config_published_indices.add(i)
                             rospy.logwarn("[frontier_ranker] Retargeted due to no movement for %.1fs to alternative goal (%.2f, %.2f)",
@@ -511,24 +503,7 @@ class FrontierRankerNode:
                     pt.header.frame_id = self.global_frame
                     pt.point.x, pt.point.y, pt.point.z = best_goal[0], best_goal[1], 0.0
                     self.goal_point_pub.publish(pt)
-                    mk = Marker()
-                    mk.header = pt.header
-                    mk.ns = "frontier_ranker"
-                    mk.id = 1
-                    mk.type = Marker.SPHERE
-                    mk.action = Marker.ADD
-                    mk.pose.position.x = best_goal[0]
-                    mk.pose.position.y = best_goal[1]
-                    mk.pose.position.z = 0.05
-                    mk.pose.orientation.w = 1.0
-                    mk.scale.x = 0.2
-                    mk.scale.y = 0.2
-                    mk.scale.z = 0.2
-                    mk.color.r = 0.8
-                    mk.color.g = 0.2
-                    mk.color.b = 1.0
-                    mk.color.a = 0.9
-                    mk.lifetime = rospy.Duration(2.0)
+                    mk = self._make_marker(pt.header, best_goal[0], best_goal[1], mid=1, rgb=(0.8, 0.2, 1.0))
                     self.goal_marker_pub.publish(mk)
                     return
             return
@@ -725,24 +700,7 @@ class FrontierRankerNode:
         pt.point.x, pt.point.y, pt.point.z = best_goal[0], best_goal[1], 0.0
         self.goal_point_pub.publish(pt)
 
-        mk = Marker()
-        mk.header = pt.header
-        mk.ns = "frontier_ranker"
-        mk.id = 1
-        mk.type = Marker.SPHERE
-        mk.action = Marker.ADD
-        mk.pose.position.x = best_goal[0]
-        mk.pose.position.y = best_goal[1]
-        mk.pose.position.z = 0.05
-        mk.pose.orientation.w = 1.0
-        mk.scale.x = 0.2
-        mk.scale.y = 0.2
-        mk.scale.z = 0.2
-        mk.color.r = 1.0
-        mk.color.g = 0.2
-        mk.color.b = 0.2
-        mk.color.a = 0.9
-        mk.lifetime = rospy.Duration(2.0)
+        mk = self._make_marker(pt.header, best_goal[0], best_goal[1], mid=1, rgb=(1.0, 0.2, 0.2))
         self.goal_marker_pub.publish(mk)
         t_end = time.time()
         # Detailed timing/metrics for this cycle

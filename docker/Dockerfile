@@ -51,21 +51,12 @@ RUN apt-get install -y \
     ros-noetic-amcl \
     ros-noetic-move-base
 
-# SLAM options
+# SLAM
 RUN apt-get install -y \
-    ros-noetic-slam-gmapping \
-    ros-noetic-rtabmap-ros
+    ros-noetic-slam-gmapping
 
-# Exploration packages
-RUN apt-get install -y \
-    ros-noetic-explore-lite
-
-# depthimage_to_laserscan (apt is simpler than source)
-RUN apt-get install -y ros-noetic-depthimage-to-laserscan
-
-# Useful utils
-RUN apt-get install -y \
-    ros-noetic-tf2-tools ros-noetic-rqt ros-noetic-rqt-common-plugins
+# Minimal runtime utilities only
+RUN apt-get install -y ros-noetic-tf2-tools
 
 # Python deps for frontier ranking
 RUN apt-get update && apt-get install -y \
@@ -87,4 +78,3 @@ COPY entrypoint.sh /ws/entrypoint.sh
 RUN chmod +x /ws/entrypoint.sh
 
 CMD ["/bin/bash"]
-

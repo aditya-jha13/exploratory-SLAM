@@ -19,5 +19,6 @@ include_directories(
 catkin_install_python(PROGRAMS
   scripts/frontier_ranker_node.py
   scripts/visited_grid_node.py
+  scripts/frontier_core.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
