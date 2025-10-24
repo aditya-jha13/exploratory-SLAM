@@ -10,6 +10,7 @@ https://github.com/user-attachments/assets/2bfaccc4-1a94-4236-867b-ec70715e4156
 
 ## Setup
 - Prerequisites: Docker and Docker Compose plugin.
+- Setup Husky Navigation: `./scripts/vendor_husky_nav.sh`
 - Allow X11 (Linux): `xhost +local:` (revoke with `xhost -local:`)
 - Build image: `docker compose -f docker/docker-compose.yml build`
 - Start container: `docker compose -f docker/docker-compose.yml up -d`
